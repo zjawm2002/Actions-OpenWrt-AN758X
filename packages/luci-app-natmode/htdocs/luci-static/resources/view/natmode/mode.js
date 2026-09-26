@@ -17,7 +17,8 @@
 
 function parseStatus(text) {
 	var st = { mode: '?', effective: '?', fullcone: '0',
-	           random_rules: '0', offload: 'off', module: '?' };
+	           random_rules: '0', srcnat_chains: '0', offload: 'off',
+	           fw_mode: 'restricted', module: '?', synced: '0', healed: '0' };
 	(text || '').split('\n').forEach(function(line) {
 		var kv = line.split('=');
 		if (kv.length >= 2)
@@ -43,33 +44,62 @@ function offloadLabel(v) {
 	}
 }
 
+// 防火墙页（网络 → 防火墙 → 常规设置）此刻的显示状态。
+// 那个「启用 FullCone NAT」复选框读的就是 firewall.@defaults[0].fullcone，
+// 与本插件同一个 UCI 键 —— 所以本页改动后防火墙页会同步反映。
+//
+// 但要注意：防火墙页只能表达「开 / 关 fullcone」两种状态，
+// 无法表达 NAT4（随机端口）。故 NAT4 与「受限型」在防火墙页看起来一样
+// （都是未勾选），真正的差异只在本页的「随机端口规则」上。
+function fwPageLabel(st) {
+	if (st.fw_mode === 'fullcone')
+		return _('已勾选「启用 FullCone NAT」');
+	if (st.effective === 'symmetric')
+		return _('未勾选（防火墙页无法表达 NAT4，随机端口仅本页可见）');
+	return _('未勾选「启用 FullCone NAT」');
+}
+
 function renderStatus(st) {
 	var rows = [
-		_('本页设置'),        modeLabel(st.mode),
-		_('实际生效'),        modeLabel(st.effective),
+		_('当前模式'),        modeLabel(st.effective),
 		_('FullCone 开关'),   (st.fullcone === '1' ? _('已启用') : _('已关闭')),
+		_('防火墙页对应状态'), fwPageLabel(st),
 		_('随机端口规则'),    (st.random_rules !== '0'
 			? _('已注入 ') + st.random_rules + _(' 条') : _('无')),
+		_('srcnat 链'),       st.srcnat_chains + _(' 个'),
 		_('路由/NAT 卸载'),   offloadLabel(st.offload),
 		_('fullcone 内核模块'), (st.module === 'loaded' ? _('已加载') : _('未加载'))
 	];
 
-	var warn = [];
+	var notice = [];  // 蓝色提示
+	var warn = [];    // 黄色警告
 
-	// 与防火墙页面的 FullCone 开关不一致：
-	// 网络 → 防火墙 → 常规设置 里的「启用 FullCone NAT」写的就是
-	// firewall.@defaults[0].fullcone，与本插件同一个 UCI 键。
-	// 在那边直接改不会同步本页的 natmode.main.mode。
-	if (st.mode !== st.effective)
-		warn.push(E('p', {}, _('本页设置与实际生效不一致：可能已在「网络 → 防火墙 → 常规设置」'
-			+ '直接改动过 FullCone 开关。请在本页重新选择并保存以同步。')));
+	// 反向同步提示：natmode-apply status 发现 firewall 侧被改过时，
+	// 会把实际生效的模式写回 natmode.main.mode（synced=1）。
+	if (st.synced === '1')
+		notice.push(E('p', {}, _('已与防火墙同步：检测到你在「网络 → 防火墙 → 常规设置」'
+			+ '改动过 FullCone 开关，本页已按实际生效状态更新为 ')
+			+ modeLabel(st.effective) + _('。')));
+
+	// 自愈提示：NAT4 的 nft 规则被 fw4 reload 冲掉后，status 会自动补回
+	if (st.healed === '1')
+		notice.push(E('p', {}, _('已自动修复：NAT4 的随机端口规则此前被防火墙重载清除，现已重新注入。')));
 
 	if (st.module !== 'loaded' && st.effective === 'fullcone')
 		warn.push(E('p', {}, _('未检测到 nft_fullcone 模块，全锥形可能不生效。')));
 
-	if (st.offload !== 'off' && st.effective !== 'restricted')
-		warn.push(E('p', {}, _('已开启路由/NAT 卸载，卸载流量会绕过 conntrack，'
-			+ '可能使全锥形或随机端口行为不稳定。建议测 NAT 类型时临时关闭卸载。')));
+	// NAT4 与卸载互斥 —— 这是「NAT4 设置了却不生效」最常见的原因
+	if (st.effective === 'symmetric' && st.offload !== 'off')
+		warn.push(E('p', {}, _('NAT4 与路由/NAT 卸载互斥：卸载流量绕过 conntrack，'
+			+ '随机端口规则不参与转发，实测仍是 NAT3。'
+			+ '请关闭卸载，或勾选下方「应用 NAT4 时自动关闭卸载」后重新保存。')));
+	else if (st.effective === 'fullcone' && st.offload !== 'off')
+		warn.push(E('p', {}, _('已开启路由/NAT 卸载，卸载流量绕过 conntrack，'
+			+ '可能使全锥形行为不稳定。测 NAT 类型时建议临时关闭卸载。')));
+
+	if (st.effective === 'symmetric' && st.srcnat_chains === '0')
+		warn.push(E('p', {}, _('未找到 fw4 的 srcnat_<zone> 链：'
+			+ 'WAN 区域可能未启用 MASQUERADE，随机端口规则无处可插。')));
 
 	var table = E('table', { 'class': 'table' });
 	for (var i = 0; i < rows.length; i += 2) {
@@ -80,6 +110,9 @@ function renderStatus(st) {
 	}
 
 	var children = [ E('h3', _('当前状态')), table ];
+	notice.forEach(function(w) {
+		children.push(E('div', { 'class': 'alert-message notice' }, [ w ]));
+	});
 	warn.forEach(function(w) {
 		children.push(E('div', { 'class': 'alert-message warning' }, [ w ]));
 	});
@@ -113,7 +146,22 @@ return view.extend({
 		var s = m.section(form.NamedSection, 'main', 'natmode');
 		s.anonymous = false;
 
-		var o = s.option(form.RadioValue, 'mode', _('NAT 类型'));
+		// =========================================================
+		// 必须用 form.ListValue + widget='radio'，不能用 form.RadioValue！
+		//
+		// luci-base 的 form.js 里根本没有 RadioValue 这个类：
+		//   可选类只有 Value / DynamicList / ListValue / RichListValue /
+		//   RangeSliderValue / Flag / MultiValue / TextValue / DummyValue /
+		//   Button / HiddenValue / FileUpload / DirectoryPicker / SectionValue
+		// 传 undefined 进去，AbstractSection.option() 做
+		//   L.Class.isSubclass(...) 检查失败 → 抛
+		//   TypeError: Class must be a descendant of CBIAbstractValue
+		//
+		// ListValue 支持 widget='select'（默认）或 'radio'，
+		// 配合 orientation='vertical' 就是竖排单选按钮。
+		// =========================================================
+		var o = s.option(form.ListValue, 'mode', _('NAT 类型'));
+		o.widget = 'radio';
 		o.orientation = 'vertical';
 		o.value('fullcone',
 			_('全锥形NAT') + '（NAT1）— ' +
@@ -126,13 +174,26 @@ return view.extend({
 			_('端口完全随机，映射不可预测，打洞基本不可用。仅用于特殊合规场景。'));
 		o.default = 'fullcone';
 
+		var oc = s.option(form.Flag, 'auto_offload',
+			_('应用 NAT4 时自动关闭路由/NAT 卸载'),
+			_('NAT4 的随机端口依赖 nft masquerade，而卸载（尤其硬件卸载走 PPE）'
+			+ '会把流量绕过 conntrack 直接转发 —— 两者互斥，开着卸载 NAT4 实测仍是 NAT3。'
+			+ '勾选后，选择「全对称型NAT」时会自动关闭卸载（代价：吞吐下降）。'));
+		oc.default = '1';
+
 		// 保存后真正应用（改 firewall 配置 + 重载 fw4 + 注入随机端口规则）
+		//
+		// 顺序很关键：必须先 ui.changes.apply() 再 exec apply。
+		// apply 内部最后一步才插入 nft 的 fully-random 规则；若之后又发生
+		// 一次 firewall reload（ui.changes.apply() 触发 reload_config），
+		// 刚插的规则会被 fw4 重建 ruleset 时冲掉 —— 这正是
+		// 「NAT1 能生效、NAT4 不生效」的根因。
 		m.handleSaveApply = function(ev) {
 			var self = this;
 			return self.handleSave(ev).then(function() {
-				return fs.exec('/usr/sbin/natmode-apply', ['apply']);
-			}).then(function() {
 				return ui.changes.apply();
+			}).then(function() {
+				return fs.exec('/usr/sbin/natmode-apply', ['apply']);
 			}).then(function() {
 				ui.addNotification(null,
 					E('p', _('NAT 模式已应用，防火墙已重载。')), 'success');
@@ -143,6 +204,26 @@ return view.extend({
 			});
 		};
 
-		return E('div', {}, [ renderStatus(st), m.render() ]);
+		// =========================================================
+		// m.render() 返回的是 Promise，不是 DOM 节点！
+		//
+		// form.js: CBIMap.prototype.render()
+		//   render() { return this.load().then(this.renderContents.bind(this)); }
+		// 而 renderContents() → renderChildren().then(nodes => ...)
+		//
+		// 若直接 E('div', {}, [ 状态块, m.render() ])，Promise 不会被 E()
+		// 解析，页面上就显示 "[object Promise]" —— 表单（单选按钮）
+		// 根本没渲染出来，于是无法更改 NAT 类型。
+		//
+		// 正确做法：等 Promise resolve 拿到节点数组，再组装。
+		// =========================================================
+		return m.render().then(function(nodes) {
+			var kids = [ renderStatus(st) ];
+			if (Array.isArray(nodes))
+				kids = kids.concat(nodes);
+			else if (nodes != null)
+				kids.push(nodes);
+			return E('div', {}, kids);
+		});
 	}
 });
